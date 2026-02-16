@@ -1,4 +1,3 @@
-````markdown
 # PyOBJViewer
 
 A minimal **Wavefront `.obj` model viewer** written in Python. The repo is intentionally lightweight and currently centers around a single entrypoint script (`main.py`) plus standard community/security files. :contentReference[oaicite:0]{index=0}
