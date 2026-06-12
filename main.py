@@ -15,6 +15,8 @@ try:
 except ImportError:
     _np = None
 
+__version__ = "2.0.0"
+
 DEFAULT_COLOR = "#6a8bd6"
 LIGHT_DIRECTION = (-0.45, 0.65, -1.0)
 NEAR_CLIP = 0.08
@@ -715,7 +717,7 @@ class OBJModel:
 class ModelViewer(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("PyOBJViewer - Advanced 3D Model Viewer")
+        self.title(f"PyOBJViewer {__version__} - Advanced 3D Model Viewer")
         self.geometry("1220x820")
         self.minsize(860, 600)
 
@@ -2349,6 +2351,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         description="Dependency-free 3D model viewer for OBJ and STL files.",
     )
     parser.add_argument("path", nargs="?", help="model file to open (.obj or .stl)")
+    parser.add_argument(
+        "--version", action="version", version=f"PyOBJViewer {__version__}"
+    )
     parser.add_argument("--dark", action="store_true", help="start with the dark background")
     parser.add_argument("--ortho", action="store_true", help="start in orthographic projection")
     parser.add_argument("--spin", action="store_true", help="start with auto-spin enabled")
