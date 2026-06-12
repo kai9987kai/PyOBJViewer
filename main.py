@@ -1,16 +1,39 @@
 from __future__ import annotations
 
+import argparse
 import math
+import struct
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+try:
+    import numpy as _np
+except ImportError:
+    _np = None
+
 DEFAULT_COLOR = "#6a8bd6"
 LIGHT_DIRECTION = (-0.45, 0.65, -1.0)
 NEAR_CLIP = 0.08
 NORMAL_EPS = 1e-22
+CREASE_ANGLE_DEG = 52.0
+NUMPY_VERTEX_THRESHOLD = 1500
+SHADOW_MIN_LIGHT_Y = 0.08
+
+GAMMA = 2.2
+_INV_GAMMA = 1.0 / GAMMA
+_SRGB_TO_LINEAR = tuple((i / 255.0) ** GAMMA for i in range(256))
+
+
+def _linear_to_srgb_byte(value: float) -> int:
+    if value <= 0.0:
+        return 0
+    if value >= 1.0:
+        return 255
+    return int(value**_INV_GAMMA * 255.0 + 0.5)
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -189,16 +212,54 @@ class Triangle:
     color: str
 
 
+def _corner_angle(
+    apex: tuple[float, float, float],
+    b: tuple[float, float, float],
+    c: tuple[float, float, float],
+) -> float:
+    abx = b[0] - apex[0]
+    aby = b[1] - apex[1]
+    abz = b[2] - apex[2]
+    acx = c[0] - apex[0]
+    acy = c[1] - apex[1]
+    acz = c[2] - apex[2]
+    len_ab = math.sqrt(abx * abx + aby * aby + abz * abz)
+    len_ac = math.sqrt(acx * acx + acy * acy + acz * acz)
+    if len_ab <= 0.0 or len_ac <= 0.0:
+        return 0.0
+    cos_angle = (abx * acx + aby * acy + abz * acz) / (len_ab * len_ac)
+    return math.acos(clamp(cos_angle, -1.0, 1.0))
+
+
 class OBJModel:
     def __init__(
         self,
         vertices: list[tuple[float, float, float]],
         triangles: list[Triangle],
+        corner_normals: list[
+            tuple[
+                tuple[float, float, float],
+                tuple[float, float, float],
+                tuple[float, float, float],
+            ]
+            | None
+        ]
+        | None = None,
     ) -> None:
         self.vertices = vertices
         self.triangles = triangles
         self.normalized_vertices = self._normalize_vertices(vertices)
         self.normalized_bounds = self._compute_bounds(self.normalized_vertices)
+        self.flat_normals = self._compute_flat_normals(self.normalized_vertices, triangles)
+        self.smooth_normals = self._compute_smooth_normals(
+            self.normalized_vertices, triangles, self.flat_normals, corner_normals
+        )
+        self._stats: dict[str, object] | None = None
+        self._np_vertices = (
+            _np.asarray(self.normalized_vertices, dtype=_np.float64)
+            if _np is not None
+            else None
+        )
 
     @staticmethod
     def _normalize_vertices(
@@ -234,6 +295,235 @@ class OBJModel:
         zs = [vertex[2] for vertex in vertices]
         return (min(xs), max(xs), min(ys), max(ys), min(zs), max(zs))
 
+    @staticmethod
+    def _compute_flat_normals(
+        vertices: list[tuple[float, float, float]],
+        triangles: list[Triangle],
+    ) -> list[tuple[float, float, float]]:
+        normals: list[tuple[float, float, float]] = []
+        for tri in triangles:
+            p0 = vertices[tri.i0]
+            p1 = vertices[tri.i1]
+            p2 = vertices[tri.i2]
+            ax = p1[0] - p0[0]
+            ay = p1[1] - p0[1]
+            az = p1[2] - p0[2]
+            bx = p2[0] - p0[0]
+            by = p2[1] - p0[1]
+            bz = p2[2] - p0[2]
+            nx = ay * bz - az * by
+            ny = az * bx - ax * bz
+            nz = ax * by - ay * bx
+            normal_sq = nx * nx + ny * ny + nz * nz
+            if normal_sq <= NORMAL_EPS:
+                normals.append((0.0, 0.0, 0.0))
+                continue
+            inv_len = 1.0 / math.sqrt(normal_sq)
+            normals.append((nx * inv_len, ny * inv_len, nz * inv_len))
+        return normals
+
+    @staticmethod
+    def _compute_smooth_normals(
+        vertices: list[tuple[float, float, float]],
+        triangles: list[Triangle],
+        flat_normals: list[tuple[float, float, float]],
+        corner_normals: list[
+            tuple[
+                tuple[float, float, float],
+                tuple[float, float, float],
+                tuple[float, float, float],
+            ]
+            | None
+        ]
+        | None,
+    ) -> list[tuple[float, float, float]]:
+        smooth: list[tuple[float, float, float]] = []
+
+        if corner_normals is not None and any(entry is not None for entry in corner_normals):
+            # Authored vn data wins: average the three corner normals per triangle.
+            for tri_idx, entry in enumerate(corner_normals):
+                if entry is None:
+                    smooth.append(flat_normals[tri_idx])
+                    continue
+                n0, n1, n2 = entry
+                averaged = normalize(
+                    (n0[0] + n1[0] + n2[0], n0[1] + n1[1] + n2[1], n0[2] + n1[2] + n2[2])
+                )
+                smooth.append(averaged if averaged != (0.0, 0.0, 0.0) else flat_normals[tri_idx])
+            return smooth
+
+        # Angle-weighted vertex normals (Thurmer & Wuthrich 1998), then a
+        # crease test per corner so hard edges stay hard.
+        accum_x = [0.0] * len(vertices)
+        accum_y = [0.0] * len(vertices)
+        accum_z = [0.0] * len(vertices)
+        for tri_idx, tri in enumerate(triangles):
+            fn = flat_normals[tri_idx]
+            if fn == (0.0, 0.0, 0.0):
+                continue
+            p0 = vertices[tri.i0]
+            p1 = vertices[tri.i1]
+            p2 = vertices[tri.i2]
+            for corner, pa, pb, pc in (
+                (tri.i0, p0, p1, p2),
+                (tri.i1, p1, p2, p0),
+                (tri.i2, p2, p0, p1),
+            ):
+                weight = _corner_angle(pa, pb, pc)
+                accum_x[corner] += fn[0] * weight
+                accum_y[corner] += fn[1] * weight
+                accum_z[corner] += fn[2] * weight
+
+        vertex_normals: list[tuple[float, float, float]] = [
+            normalize((accum_x[idx], accum_y[idx], accum_z[idx]))
+            for idx in range(len(vertices))
+        ]
+
+        crease_cos = math.cos(math.radians(CREASE_ANGLE_DEG))
+        for tri_idx, tri in enumerate(triangles):
+            fn = flat_normals[tri_idx]
+            if fn == (0.0, 0.0, 0.0):
+                smooth.append(fn)
+                continue
+            sum_x = sum_y = sum_z = 0.0
+            for corner in (tri.i0, tri.i1, tri.i2):
+                vn = vertex_normals[corner]
+                if vn[0] * fn[0] + vn[1] * fn[1] + vn[2] * fn[2] >= crease_cos:
+                    sum_x += vn[0]
+                    sum_y += vn[1]
+                    sum_z += vn[2]
+                else:
+                    sum_x += fn[0]
+                    sum_y += fn[1]
+                    sum_z += fn[2]
+            averaged = normalize((sum_x, sum_y, sum_z))
+            smooth.append(averaged if averaged != (0.0, 0.0, 0.0) else fn)
+        return smooth
+
+    def compute_stats(self) -> dict[str, object]:
+        if self._stats is not None:
+            return self._stats
+
+        area = 0.0
+        volume = 0.0
+        edge_counts: dict[tuple[int, int], int] = {}
+        for tri in self.triangles:
+            p0 = self.vertices[tri.i0]
+            p1 = self.vertices[tri.i1]
+            p2 = self.vertices[tri.i2]
+            ax = p1[0] - p0[0]
+            ay = p1[1] - p0[1]
+            az = p1[2] - p0[2]
+            bx = p2[0] - p0[0]
+            by = p2[1] - p0[1]
+            bz = p2[2] - p0[2]
+            cx = ay * bz - az * by
+            cy = az * bx - ax * bz
+            cz = ax * by - ay * bx
+            area += 0.5 * math.sqrt(cx * cx + cy * cy + cz * cz)
+            # Signed tetrahedron volume (divergence theorem); valid when closed.
+            volume += (
+                p0[0] * (p1[1] * p2[2] - p1[2] * p2[1])
+                - p0[1] * (p1[0] * p2[2] - p1[2] * p2[0])
+                + p0[2] * (p1[0] * p2[1] - p1[1] * p2[0])
+            ) / 6.0
+            for ia, ib in ((tri.i0, tri.i1), (tri.i1, tri.i2), (tri.i2, tri.i0)):
+                key = (ia, ib) if ia < ib else (ib, ia)
+                edge_counts[key] = edge_counts.get(key, 0) + 1
+
+        boundary_edges = sum(1 for count in edge_counts.values() if count == 1)
+        nonmanifold_edges = sum(1 for count in edge_counts.values() if count > 2)
+        min_x, max_x, min_y, max_y, min_z, max_z = self._compute_bounds(self.vertices)
+
+        self._stats = {
+            "vertices": len(self.vertices),
+            "triangles": len(self.triangles),
+            "size": (max_x - min_x, max_y - min_y, max_z - min_z),
+            "surface_area": area,
+            "volume": abs(volume),
+            "edges": len(edge_counts),
+            "boundary_edges": boundary_edges,
+            "nonmanifold_edges": nonmanifold_edges,
+            "watertight": boundary_edges == 0 and nonmanifold_edges == 0,
+        }
+        return self._stats
+
+    @classmethod
+    def load(cls, filepath: str) -> "OBJModel":
+        if Path(filepath).suffix.lower() == ".stl":
+            return cls.from_stl(filepath)
+        return cls.from_obj(filepath)
+
+    @classmethod
+    def from_stl(cls, filepath: str) -> "OBJModel":
+        stl_path = Path(filepath)
+        if not stl_path.exists():
+            raise ValueError("STL file was not found.")
+
+        try:
+            raw = stl_path.read_bytes()
+        except OSError as exc:
+            raise ValueError(f"Failed to read STL file: {exc}") from exc
+
+        facets: list[tuple[tuple[float, float, float], ...]] = []
+        is_binary = False
+        if len(raw) >= 84:
+            (declared_count,) = struct.unpack_from("<I", raw, 80)
+            if 84 + declared_count * 50 == len(raw):
+                is_binary = True
+
+        if is_binary:
+            (count,) = struct.unpack_from("<I", raw, 80)
+            offset = 84
+            for _ in range(count):
+                values = struct.unpack_from("<12fH", raw, offset)
+                offset += 50
+                facets.append(
+                    (
+                        (values[3], values[4], values[5]),
+                        (values[6], values[7], values[8]),
+                        (values[9], values[10], values[11]),
+                    )
+                )
+        else:
+            current: list[tuple[float, float, float]] = []
+            for raw_line in raw.decode("ascii", errors="ignore").splitlines():
+                parts = raw_line.split()
+                if len(parts) >= 4 and parts[0] == "vertex":
+                    try:
+                        current.append((float(parts[1]), float(parts[2]), float(parts[3])))
+                    except ValueError:
+                        continue
+                    if len(current) == 3:
+                        facets.append((current[0], current[1], current[2]))
+                        current = []
+
+        if not facets:
+            raise ValueError("No facets were found in this STL file.")
+
+        # Weld duplicated facet vertices so smooth shading has shared indices.
+        vertex_index: dict[tuple[float, float, float], int] = {}
+        vertices: list[tuple[float, float, float]] = []
+        triangles: list[Triangle] = []
+        for facet in facets:
+            indices: list[int] = []
+            for point in facet:
+                existing = vertex_index.get(point)
+                if existing is None:
+                    existing = len(vertices)
+                    vertex_index[point] = existing
+                    vertices.append(point)
+                indices.append(existing)
+            if indices[0] != indices[1] and indices[1] != indices[2] and indices[0] != indices[2]:
+                triangles.append(
+                    Triangle(i0=indices[0], i1=indices[1], i2=indices[2], color=DEFAULT_COLOR)
+                )
+
+        if not triangles:
+            raise ValueError("No valid triangles were generated from this STL file.")
+
+        return cls(vertices=vertices, triangles=triangles)
+
     @classmethod
     def from_obj(cls, filepath: str) -> "OBJModel":
         obj_path = Path(filepath)
@@ -241,7 +531,11 @@ class OBJModel:
             raise ValueError("OBJ file was not found.")
 
         vertices: list[tuple[float, float, float]] = []
-        polygons: list[tuple[tuple[int, ...], str | None]] = []
+        vertex_colors: list[tuple[float, float, float] | None] = []
+        normals: list[tuple[float, float, float]] = []
+        polygons: list[
+            tuple[tuple[int, ...], tuple[int | None, ...], str | None]
+        ] = []
         mtl_libraries: list[str] = []
         current_material: str | None = None
 
@@ -263,6 +557,30 @@ class OBJModel:
                         except ValueError:
                             continue
                         vertices.append((x, y, z))
+                        # Non-standard but common extension: v x y z r g b
+                        color: tuple[float, float, float] | None = None
+                        if len(parts) >= 7:
+                            try:
+                                color = (
+                                    clamp(float(parts[4]), 0.0, 1.0),
+                                    clamp(float(parts[5]), 0.0, 1.0),
+                                    clamp(float(parts[6]), 0.0, 1.0),
+                                )
+                            except ValueError:
+                                color = None
+                        vertex_colors.append(color)
+                        continue
+
+                    if line.startswith("vn "):
+                        parts = line.split()
+                        if len(parts) < 4:
+                            continue
+                        try:
+                            normals.append(
+                                normalize((float(parts[1]), float(parts[2]), float(parts[3])))
+                            )
+                        except ValueError:
+                            continue
                         continue
 
                     if line.startswith("mtllib "):
@@ -286,9 +604,12 @@ class OBJModel:
                             continue
 
                         indices: list[int] = []
+                        normal_indices: list[int | None] = []
                         vertex_total = len(vertices)
+                        normal_total = len(normals)
                         for token in tokens:
-                            vertex_token = token.split("/", 1)[0]
+                            pieces = token.split("/")
+                            vertex_token = pieces[0]
                             if not vertex_token:
                                 continue
                             try:
@@ -302,8 +623,26 @@ class OBJModel:
                                 resolved_index = raw_index - 1
                             indices.append(resolved_index)
 
+                            normal_index: int | None = None
+                            if len(pieces) >= 3 and pieces[2]:
+                                try:
+                                    raw_normal = int(pieces[2])
+                                except ValueError:
+                                    raw_normal = 0
+                                if raw_normal < 0:
+                                    normal_index = normal_total + raw_normal
+                                elif raw_normal > 0:
+                                    normal_index = raw_normal - 1
+                                if normal_index is not None and not (
+                                    0 <= normal_index < normal_total
+                                ):
+                                    normal_index = None
+                            normal_indices.append(normal_index)
+
                         if len(indices) >= 3:
-                            polygons.append((tuple(indices), current_material))
+                            polygons.append(
+                                (tuple(indices), tuple(normal_indices), current_material)
+                            )
         except OSError as exc:
             raise ValueError(f"Failed to read OBJ file: {exc}") from exc
 
@@ -316,10 +655,19 @@ class OBJModel:
         vertex_count = len(vertices)
 
         triangles: list[Triangle] = []
+        corner_normals: list[
+            tuple[
+                tuple[float, float, float],
+                tuple[float, float, float],
+                tuple[float, float, float],
+            ]
+            | None
+        ] = []
 
-        for polygon, material_name in polygons:
-            color = material_colors.get(material_name or "", DEFAULT_COLOR)
+        for polygon, polygon_normals, material_name in polygons:
+            material_color = material_colors.get(material_name or "")
             i0 = polygon[0]
+            n0 = polygon_normals[0]
             for index in range(1, len(polygon) - 1):
                 i1 = polygon[index]
                 i2 = polygon[index + 1]
@@ -333,18 +681,41 @@ class OBJModel:
                 ):
                     continue
 
+                color = material_color
+                if color is None:
+                    c0 = vertex_colors[i0]
+                    c1 = vertex_colors[i1]
+                    c2 = vertex_colors[i2]
+                    if c0 is not None and c1 is not None and c2 is not None:
+                        color = to_hex_color(
+                            (
+                                int((c0[0] + c1[0] + c2[0]) / 3.0 * 255),
+                                int((c0[1] + c1[1] + c2[1]) / 3.0 * 255),
+                                int((c0[2] + c1[2] + c2[2]) / 3.0 * 255),
+                            )
+                        )
+                if color is None:
+                    color = DEFAULT_COLOR
+
                 triangles.append(Triangle(i0=i0, i1=i1, i2=i2, color=color))
+
+                n1 = polygon_normals[index]
+                n2 = polygon_normals[index + 1]
+                if n0 is not None and n1 is not None and n2 is not None:
+                    corner_normals.append((normals[n0], normals[n1], normals[n2]))
+                else:
+                    corner_normals.append(None)
 
         if not triangles:
             raise ValueError("No valid triangles were generated from this OBJ file.")
 
-        return cls(vertices=vertices, triangles=triangles)
+        return cls(vertices=vertices, triangles=triangles, corner_normals=corner_normals)
 
 
 class ModelViewer(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Advanced 3D Model Viewer")
+        self.title("PyOBJViewer - Advanced 3D Model Viewer")
         self.geometry("1220x820")
         self.minsize(860, 600)
 
@@ -367,19 +738,24 @@ class ModelViewer(tk.Tk):
         self._interaction_deadline = 0.0
         self._last_frame_time = time.perf_counter()
         self._fps = 0.0
+        self._inertia_x = 0.0
+        self._inertia_y = 0.0
+        self._last_drag_event = 0.0
+        self._last_render_capture: dict[str, object] | None = None
 
         initial_light = normalize(LIGHT_DIRECTION)
         initial_azimuth = math.degrees(math.atan2(initial_light[2], initial_light[0]))
         initial_elevation = math.degrees(math.asin(clamp(initial_light[1], -1.0, 1.0)))
         self._light_dir = initial_light
-        self._rgb_cache: dict[str, tuple[int, int, int]] = {}
-        self._shade_cache: dict[tuple[str, int], str] = {}
+        self._linear_cache: dict[str, tuple[float, float, float]] = {}
         self._phong_cache: dict[tuple[str, int, int], str] = {}
         self._heat_cache: dict[int, str] = {}
 
         self.fill_var = tk.BooleanVar(value=True)
         self.wireframe_var = tk.BooleanVar(value=True)
         self.shading_var = tk.BooleanVar(value=True)
+        self.smooth_var = tk.BooleanVar(value=True)
+        self.shadow_var = tk.BooleanVar(value=True)
         self.culling_var = tk.BooleanVar(value=False)
         self.invert_culling_var = tk.BooleanVar(value=False)
         self.depth_sort_var = tk.BooleanVar(value=True)
@@ -393,8 +769,8 @@ class ModelViewer(tk.Tk):
 
         self.quality_var = tk.StringVar(value="Auto")
         self.color_mode_var = tk.StringVar(value="Material")
-        self.ambient_var = tk.DoubleVar(value=0.26)
-        self.diffuse_var = tk.DoubleVar(value=0.80)
+        self.ambient_var = tk.DoubleVar(value=0.18)
+        self.diffuse_var = tk.DoubleVar(value=0.85)
         self.ambient_value_var = tk.StringVar(value=f"{self.ambient_var.get():.2f}")
         self.diffuse_value_var = tk.StringVar(value=f"{self.diffuse_var.get():.2f}")
         self.specular_var = tk.DoubleVar(value=0.22)
@@ -414,9 +790,10 @@ class ModelViewer(tk.Tk):
         self.spin_speed_var = tk.DoubleVar(value=1.0)
         self.spin_speed_value_var = tk.StringVar(value=f"{self.spin_speed_var.get():.2f}x")
 
-        self.status_var = tk.StringVar(value="Load an OBJ file to begin.")
+        self.status_var = tk.StringVar(value="Load an OBJ or STL file to begin.")
         self._overlay_color = "#2c3642"
         self._hint_color = "#49596c"
+        self._shadow_color = "#d3dae4"
 
         self._on_light_direction_change(render=False)
         self._on_wire_width_change(render=False)
@@ -517,6 +894,9 @@ class ModelViewer(tk.Tk):
         ttk.Button(buttons_row, text="Top", command=self.set_top_view).pack(side="left", padx=(0, 6))
         ttk.Button(buttons_row, text="Right", command=self.set_right_view).pack(side="left", padx=(0, 6))
         ttk.Button(buttons_row, text="Save Snapshot", command=self.save_snapshot).pack(
+            side="left", padx=(0, 6)
+        )
+        ttk.Button(buttons_row, text="Model Info", command=self.show_model_info).pack(
             side="left", padx=(0, 10)
         )
         ttk.Button(buttons_row, text="Fullscreen", command=self.toggle_fullscreen).pack(
@@ -536,6 +916,8 @@ class ModelViewer(tk.Tk):
             ("Fill", self.fill_var),
             ("Wireframe", self.wireframe_var),
             ("Shading", self.shading_var),
+            ("Smooth", self.smooth_var),
+            ("Shadow", self.shadow_var),
             ("Backface Culling", self.culling_var),
             ("Invert Culling", self.invert_culling_var),
             ("Depth Sort", self.depth_sort_var),
@@ -754,9 +1136,10 @@ class ModelViewer(tk.Tk):
         ).pack(side="left")
 
         help_text = (
-            "Controls: left-drag rotate, Shift+left-drag roll, right-drag pan, mouse-wheel zoom, "
-            "R reset, F fit, 1/2/3 front-top-right, 4 back, 5 left, W wireframe, S shading, C culling, I invert culling, "
-            "D depth sort, O orthographic, M render mode, N normals, A axes, G bounds, B bg, Space spin, F5 reload, F11 fullscreen"
+            "Controls: left-drag rotate (release to glide), Shift+left-drag roll, right-drag pan, wheel zooms to cursor, "
+            "R reset, F fit, 1/2/3 front-top-right, 4 back, 5 left, W wireframe, S shading, T smooth, H shadow, C culling, "
+            "I invert culling, D depth sort, O orthographic, M render mode, N normals, A axes, G bounds, B bg, Space spin, "
+            "F1 model info, F5 reload, F11 fullscreen"
         )
         ttk.Label(
             outer,
@@ -807,6 +1190,8 @@ class ModelViewer(tk.Tk):
         self.bind("<KeyPress-f>", lambda _event: self.fit_view())
         self.bind("<KeyPress-w>", lambda _event: self._toggle_and_render(self.wireframe_var))
         self.bind("<KeyPress-s>", lambda _event: self._toggle_and_render(self.shading_var))
+        self.bind("<KeyPress-t>", lambda _event: self._toggle_and_render(self.smooth_var))
+        self.bind("<KeyPress-h>", lambda _event: self._toggle_and_render(self.shadow_var))
         self.bind("<KeyPress-c>", lambda _event: self._toggle_and_render(self.culling_var))
         self.bind("<KeyPress-i>", lambda _event: self._toggle_and_render(self.invert_culling_var))
         self.bind("<KeyPress-d>", lambda _event: self._toggle_and_render(self.depth_sort_var))
@@ -822,6 +1207,7 @@ class ModelViewer(tk.Tk):
         self.bind("<KeyPress-4>", lambda _event: self.set_back_view())
         self.bind("<KeyPress-5>", lambda _event: self.set_left_view())
         self.bind("<space>", lambda _event: self._toggle_auto_spin())
+        self.bind("<F1>", lambda _event: self.show_model_info())
         self.bind("<F5>", lambda _event: self.reload_model())
         self.bind("<F11>", lambda _event: self.toggle_fullscreen())
         self.bind("<Escape>", lambda _event: self._exit_fullscreen())
@@ -901,14 +1287,18 @@ class ModelViewer(tk.Tk):
             self.canvas.configure(bg="#111a24")
             self._overlay_color = "#d7e2ee"
             self._hint_color = "#8aa0b7"
+            self._shadow_color = "#0a1018"
         else:
             self.canvas.configure(bg="#f7f9fc")
             self._overlay_color = "#2d3b4d"
             self._hint_color = "#4f6178"
+            self._shadow_color = "#d3dae4"
         self.request_render()
 
     def _on_left_press(self, event: tk.Event) -> None:
         self._drag_left = (event.x, event.y)
+        self._inertia_x = 0.0
+        self._inertia_y = 0.0
 
     def _on_left_drag(self, event: tk.Event) -> None:
         if self._drag_left is None:
@@ -922,6 +1312,9 @@ class ModelViewer(tk.Tk):
         else:
             self.rotation_y += dx * 0.01
             self.rotation_x += dy * 0.01
+            self._inertia_x = dy * 0.01
+            self._inertia_y = dx * 0.01
+            self._last_drag_event = time.perf_counter()
 
         self._drag_left = (event.x, event.y)
         self._mark_interacting()
@@ -929,6 +1322,10 @@ class ModelViewer(tk.Tk):
 
     def _on_left_release(self, _event: tk.Event) -> None:
         self._drag_left = None
+        # Only keep gliding when the pointer was still moving at release time.
+        if time.perf_counter() - self._last_drag_event > 0.06:
+            self._inertia_x = 0.0
+            self._inertia_y = 0.0
 
     def _on_right_press(self, event: tk.Event) -> None:
         self._drag_right = (event.x, event.y)
@@ -955,7 +1352,15 @@ class ModelViewer(tk.Tk):
         elif hasattr(event, "num"):
             wheel_up = event.num == 4
 
-        self.zoom = clamp(self.zoom * (1.10 if wheel_up else 0.91), 0.2, 9.0)
+        new_zoom = clamp(self.zoom * (1.10 if wheel_up else 0.91), 0.2, 9.0)
+        applied = new_zoom / self.zoom
+        if applied != 1.0:
+            # Keep the point under the cursor fixed while zooming.
+            half_w = self.canvas.winfo_width() * 0.5
+            half_h = self.canvas.winfo_height() * 0.5
+            self.pan_x = event.x - half_w - applied * (event.x - half_w - self.pan_x)
+            self.pan_y = event.y - half_h - applied * (event.y - half_h - self.pan_y)
+        self.zoom = new_zoom
         self._mark_interacting()
         self.request_render()
 
@@ -965,7 +1370,7 @@ class ModelViewer(tk.Tk):
         self.canvas.create_text(
             width / 2,
             height / 2,
-            text="Open an OBJ file to preview the model",
+            text="Open an OBJ or STL file to preview the model",
             fill=self._hint_color,
             font=("Segoe UI Semibold", 14),
         )
@@ -974,6 +1379,17 @@ class ModelViewer(tk.Tk):
         if self.auto_spin_var.get() and self.model is not None:
             self.rotation_y += 0.013 * self.spin_speed_var.get()
             self.request_render()
+        if (
+            self._drag_left is None
+            and self.model is not None
+            and (abs(self._inertia_x) > 4e-4 or abs(self._inertia_y) > 4e-4)
+        ):
+            self.rotation_x += self._inertia_x
+            self.rotation_y += self._inertia_y
+            self._inertia_x *= 0.92
+            self._inertia_y *= 0.92
+            self._mark_interacting(0.05)
+            self.request_render()
         self.after(16, self._animation_tick)
 
     def _mark_interacting(self, duration: float = 0.16) -> None:
@@ -981,27 +1397,6 @@ class ModelViewer(tk.Tk):
 
     def _is_interacting(self) -> bool:
         return time.perf_counter() < self._interaction_deadline
-
-    def _shade_color(self, base_color: str, bucket: int) -> str:
-        key = (base_color, bucket)
-        cached = self._shade_cache.get(key)
-        if cached is not None:
-            return cached
-
-        rgb = self._rgb_cache.get(base_color)
-        if rgb is None:
-            rgb = from_hex_color(base_color)
-            self._rgb_cache[base_color] = rgb
-
-        factor = bucket / 255.0
-        shaded = (
-            int(rgb[0] * factor),
-            int(rgb[1] * factor),
-            int(rgb[2] * factor),
-        )
-        result = to_hex_color(shaded)
-        self._shade_cache[key] = result
-        return result
 
     def _shade_color_phong(
         self, base_color: str, diffuse_bucket: int, specular_bucket: int
@@ -1013,17 +1408,23 @@ class ModelViewer(tk.Tk):
         if cached is not None:
             return cached
 
-        rgb = self._rgb_cache.get(base_color)
-        if rgb is None:
+        linear = self._linear_cache.get(base_color)
+        if linear is None:
             rgb = from_hex_color(base_color)
-            self._rgb_cache[base_color] = rgb
+            linear = (
+                _SRGB_TO_LINEAR[rgb[0]],
+                _SRGB_TO_LINEAR[rgb[1]],
+                _SRGB_TO_LINEAR[rgb[2]],
+            )
+            self._linear_cache[base_color] = linear
 
+        # Light in linear space, encode back to sRGB; specular adds white light.
         diffuse_factor = diffuse_bucket / 255.0
         specular_factor = specular_bucket / 255.0
         shaded = (
-            int(clamp(rgb[0] * diffuse_factor + (255 - rgb[0]) * specular_factor, 0.0, 255.0)),
-            int(clamp(rgb[1] * diffuse_factor + (255 - rgb[1]) * specular_factor, 0.0, 255.0)),
-            int(clamp(rgb[2] * diffuse_factor + (255 - rgb[2]) * specular_factor, 0.0, 255.0)),
+            _linear_to_srgb_byte(linear[0] * diffuse_factor + specular_factor),
+            _linear_to_srgb_byte(linear[1] * diffuse_factor + specular_factor),
+            _linear_to_srgb_byte(linear[2] * diffuse_factor + specular_factor),
         )
         result = to_hex_color(shaded)
         self._phong_cache[key] = result
@@ -1206,17 +1607,16 @@ class ModelViewer(tk.Tk):
 
     def _load_model_from_path(self, filepath: str) -> bool:
         try:
-            loaded = OBJModel.from_obj(filepath)
+            loaded = OBJModel.load(filepath)
         except Exception as exc:
             messagebox.showerror("Load error", f"Unable to open model:\n{exc}")
             return False
 
         self.model = loaded
         self.current_path = Path(filepath)
-        self._shade_cache.clear()
         self._phong_cache.clear()
         self._heat_cache.clear()
-        self._rgb_cache.clear()
+        self._linear_cache.clear()
 
         self.reset_view(render=False)
         self.fit_view(render=False)
@@ -1226,7 +1626,12 @@ class ModelViewer(tk.Tk):
     def open_model(self) -> None:
         filepath = filedialog.askopenfilename(
             title="Open 3D model",
-            filetypes=[("OBJ files", "*.obj"), ("All files", "*.*")],
+            filetypes=[
+                ("3D models", "*.obj *.stl"),
+                ("OBJ files", "*.obj"),
+                ("STL files", "*.stl"),
+                ("All files", "*.*"),
+            ],
         )
         if not filepath:
             return
@@ -1299,14 +1704,104 @@ class ModelViewer(tk.Tk):
 
         output_path = filedialog.asksaveasfilename(
             title="Save snapshot",
-            defaultextension=".ps",
-            filetypes=[("PostScript", "*.ps"), ("All files", "*.*")],
+            defaultextension=".svg",
+            filetypes=[
+                ("SVG vector image", "*.svg"),
+                ("PNG image (needs Pillow)", "*.png"),
+                ("PostScript", "*.ps"),
+                ("All files", "*.*"),
+            ],
         )
         if not output_path:
             return
 
-        self.canvas.postscript(file=output_path, colormode="color")
+        suffix = Path(output_path).suffix.lower()
+        try:
+            if suffix == ".svg":
+                self._write_svg_snapshot(output_path)
+            elif suffix == ".png":
+                self._write_png_snapshot(output_path)
+            else:
+                self.canvas.postscript(file=output_path, colormode="color")
+        except Exception as exc:
+            messagebox.showerror("Snapshot error", f"Unable to save snapshot:\n{exc}")
+            return
         self.status_var.set(f"Snapshot saved: {Path(output_path).name}")
+
+    def _write_svg_snapshot(self, output_path: str) -> None:
+        capture = self._last_render_capture
+        if capture is None:
+            raise ValueError("Nothing rendered yet.")
+
+        width = capture["width"]
+        height = capture["height"]
+        outline = capture["outline"]
+        wire_width = capture["wire_width"]
+        stroke = (
+            f' stroke="{outline}" stroke-width="{wire_width}" stroke-linejoin="round"'
+            if outline
+            else ""
+        )
+
+        parts: list[str] = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+            f'viewBox="0 0 {width} {height}">',
+            f'<rect width="{width}" height="{height}" fill="{capture["bg"]}"/>',
+        ]
+        shadow_polys, shadow_color = capture["shadow"]
+        for coords in shadow_polys:
+            points = " ".join(
+                f"{coords[i]:.2f},{coords[i + 1]:.2f}" for i in range(0, len(coords), 2)
+            )
+            parts.append(f'<polygon points="{points}" fill="{shadow_color}"/>')
+        for coords, fill_color in capture["polys"]:
+            points = " ".join(
+                f"{coords[i]:.2f},{coords[i + 1]:.2f}" for i in range(0, len(coords), 2)
+            )
+            fill = fill_color if fill_color else "none"
+            parts.append(f'<polygon points="{points}" fill="{fill}"{stroke}/>')
+        parts.append("</svg>")
+
+        Path(output_path).write_text("\n".join(parts), encoding="utf-8")
+
+    def _write_png_snapshot(self, output_path: str) -> None:
+        try:
+            from PIL import ImageGrab
+        except ImportError as exc:
+            raise ValueError(
+                "PNG export needs Pillow (pip install pillow). "
+                "SVG export works without extra packages."
+            ) from exc
+
+        self.update_idletasks()
+        x0 = self.canvas.winfo_rootx()
+        y0 = self.canvas.winfo_rooty()
+        x1 = x0 + self.canvas.winfo_width()
+        y1 = y0 + self.canvas.winfo_height()
+        ImageGrab.grab(bbox=(x0, y0, x1, y1)).save(output_path)
+
+    def show_model_info(self) -> None:
+        if self.model is None:
+            messagebox.showinfo("No model", "Load a model to inspect its statistics.")
+            return
+
+        stats = self.model.compute_stats()
+        size = stats["size"]
+        watertight = "yes" if stats["watertight"] else "no"
+        volume_note = "" if stats["watertight"] else " (open mesh - approximate)"
+        info = (
+            f"File: {self.current_path.name if self.current_path else 'untitled'}\n"
+            f"Vertices: {stats['vertices']:,}\n"
+            f"Triangles: {stats['triangles']:,}\n"
+            f"Edges: {stats['edges']:,}\n"
+            f"Size (X x Y x Z): {size[0]:.4g} x {size[1]:.4g} x {size[2]:.4g}\n"
+            f"Surface area: {stats['surface_area']:.6g}\n"
+            f"Volume: {stats['volume']:.6g}{volume_note}\n"
+            f"Boundary edges: {stats['boundary_edges']:,}\n"
+            f"Non-manifold edges: {stats['nonmanifold_edges']:,}\n"
+            f"Watertight: {watertight}"
+        )
+        messagebox.showinfo("Model info", info)
 
     def _render_now(self) -> None:
         self._render_pending = False
@@ -1333,42 +1828,96 @@ class ModelViewer(tk.Tk):
         cos_y, sin_y = math.cos(self.rotation_y), math.sin(self.rotation_y)
         cos_z, sin_z = math.cos(self.rotation_z), math.sin(self.rotation_z)
 
-        rotated: list[tuple[float, float, float]] = [(0.0, 0.0, 0.0)] * vertex_count
-        for idx, (vx, vy, vz) in enumerate(vertices):
-            y1 = vy * cos_x - vz * sin_x
-            z1 = vy * sin_x + vz * cos_x
-            x2 = vx * cos_y + z1 * sin_y
-            z2 = -vx * sin_y + z1 * cos_y
-            x3 = x2 * cos_z - y1 * sin_z
-            y3 = x2 * sin_z + y1 * cos_z
-            rotated[idx] = (x3, y3, z2)
+        # Combined XYZ rotation as one matrix (also reused for normals).
+        m00 = cos_y * cos_z
+        m01 = sin_x * sin_y * cos_z - cos_x * sin_z
+        m02 = cos_x * sin_y * cos_z + sin_x * sin_z
+        m10 = cos_y * sin_z
+        m11 = sin_x * sin_y * sin_z + cos_x * cos_z
+        m12 = cos_x * sin_y * sin_z - sin_x * cos_z
+        m20 = -sin_y
+        m21 = sin_x * cos_y
+        m22 = cos_x * cos_y
 
         use_ortho = self.ortho_var.get()
         near_clip = self.near_clip_var.get()
+        offset_x = half_w + self.pan_x
+        offset_y = half_h + self.pan_y
+        rotated_min_y = 0.0
 
-        camera_points: list[tuple[float, float, float]] = [(0.0, 0.0, 0.0)] * vertex_count
-        projected: list[tuple[float, float, float] | None] = [None] * vertex_count
-        if use_ortho:
-            for idx, (x, y, z) in enumerate(rotated):
-                z_cam = z + self.camera_distance
-                camera_points[idx] = (x, y, z_cam)
-                projected[idx] = (
-                    x * scale + half_w + self.pan_x,
-                    -y * scale + half_h + self.pan_y,
-                    z_cam,
-                )
+        use_numpy = (
+            _np is not None
+            and self.model._np_vertices is not None
+            and vertex_count >= NUMPY_VERTEX_THRESHOLD
+        )
+        if use_numpy:
+            rot_matrix = _np.array(
+                ((m00, m01, m02), (m10, m11, m12), (m20, m21, m22)), dtype=_np.float64
+            )
+            rot_np = self.model._np_vertices @ rot_matrix.T
+            rotated = rot_np.tolist()
+            rotated_min_y = float(rot_np[:, 1].min())
+            z_cam_np = rot_np[:, 2] + self.camera_distance
+            camera_points = _np.column_stack(
+                (rot_np[:, 0], rot_np[:, 1], z_cam_np)
+            ).tolist()
+            if use_ortho:
+                projected = _np.column_stack(
+                    (
+                        rot_np[:, 0] * scale + offset_x,
+                        -rot_np[:, 1] * scale + offset_y,
+                        z_cam_np,
+                    )
+                ).tolist()
+            else:
+                safe_z = _np.where(z_cam_np > near_clip, z_cam_np, 1.0)
+                perspective_scale = (self.focal_length * scale) / safe_z
+                projected = _np.column_stack(
+                    (
+                        rot_np[:, 0] * perspective_scale + offset_x,
+                        -rot_np[:, 1] * perspective_scale + offset_y,
+                        z_cam_np,
+                    )
+                ).tolist()
+                for idx in _np.nonzero(z_cam_np <= near_clip)[0].tolist():
+                    projected[idx] = None
         else:
-            for idx, (x, y, z) in enumerate(rotated):
-                z_cam = z + self.camera_distance
-                camera_points[idx] = (x, y, z_cam)
-                if z_cam <= near_clip:
-                    continue
-                perspective = self.focal_length / z_cam
-                projected[idx] = (
-                    x * scale * perspective + half_w + self.pan_x,
-                    -y * scale * perspective + half_h + self.pan_y,
-                    z_cam,
+            rotated = [(0.0, 0.0, 0.0)] * vertex_count
+            min_y = math.inf
+            for idx, (vx, vy, vz) in enumerate(vertices):
+                ry = m10 * vx + m11 * vy + m12 * vz
+                rotated[idx] = (
+                    m00 * vx + m01 * vy + m02 * vz,
+                    ry,
+                    m20 * vx + m21 * vy + m22 * vz,
                 )
+                if ry < min_y:
+                    min_y = ry
+            rotated_min_y = 0.0 if math.isinf(min_y) else min_y
+
+            camera_points = [(0.0, 0.0, 0.0)] * vertex_count
+            projected = [None] * vertex_count
+            if use_ortho:
+                for idx, (x, y, z) in enumerate(rotated):
+                    z_cam = z + self.camera_distance
+                    camera_points[idx] = (x, y, z_cam)
+                    projected[idx] = (
+                        x * scale + offset_x,
+                        -y * scale + offset_y,
+                        z_cam,
+                    )
+            else:
+                for idx, (x, y, z) in enumerate(rotated):
+                    z_cam = z + self.camera_distance
+                    camera_points[idx] = (x, y, z_cam)
+                    if z_cam <= near_clip:
+                        continue
+                    perspective = self.focal_length / z_cam
+                    projected[idx] = (
+                        x * scale * perspective + offset_x,
+                        -y * scale * perspective + offset_y,
+                        z_cam,
+                    )
 
         interacting = self._is_interacting()
         stride = self._triangle_stride(triangle_count, interacting)
@@ -1378,6 +1927,9 @@ class ModelViewer(tk.Tk):
         if interacting and self.quality_var.get() == "Auto" and triangle_count > 18000 and fill_enabled:
             wire_enabled = False
         shading_enabled = self.shading_var.get()
+        smooth_enabled = self.smooth_var.get()
+        shadow_enabled = self.shadow_var.get()
+        smooth_normals = self.model.smooth_normals
         culling_enabled = self.culling_var.get()
         invert_culling = self.invert_culling_var.get()
         depth_sort_enabled = self.depth_sort_var.get()
@@ -1481,21 +2033,38 @@ class ModelViewer(tk.Tk):
                     if (nx * vx + ny * vy + nz * vz) * cull_sign <= 0.0:
                         continue
 
+                shade_x, shade_y, shade_z = nx_unit, ny_unit, nz_unit
+                shade_valid = normal_sq > NORMAL_EPS
+                if smooth_enabled and (shading_enabled or normal_tint_mode):
+                    sn = smooth_normals[tri_idx]
+                    if sn[0] != 0.0 or sn[1] != 0.0 or sn[2] != 0.0:
+                        smooth_x = m00 * sn[0] + m01 * sn[1] + m02 * sn[2]
+                        smooth_y = m10 * sn[0] + m11 * sn[1] + m12 * sn[2]
+                        smooth_z = m20 * sn[0] + m21 * sn[1] + m22 * sn[2]
+                        if culling_enabled and invert_culling:
+                            smooth_x = -smooth_x
+                            smooth_y = -smooth_y
+                            smooth_z = -smooth_z
+                        shade_x, shade_y, shade_z = smooth_x, smooth_y, smooth_z
+                        shade_valid = True
+
                 if normal_tint_mode:
-                    if normal_sq > NORMAL_EPS:
+                    if shade_valid:
                         color = to_hex_color(
                             (
-                                int(abs(nx_unit) * 255),
-                                int(abs(ny_unit) * 255),
-                                int(abs(nz_unit) * 255),
+                                int(abs(shade_x) * 255),
+                                int(abs(shade_y) * 255),
+                                int(abs(shade_z) * 255),
                             )
                         )
                     else:
                         color = "#808080"
-                elif shading_enabled and normal_sq > NORMAL_EPS:
-                    light_dot = nx_unit * lx + ny_unit * ly + nz_unit * lz
+                elif shading_enabled and shade_valid:
+                    light_dot = shade_x * lx + shade_y * ly + shade_z * lz
                     diffuse = max(0.0, light_dot if culling_enabled else abs(light_dot))
-                    diffuse_term = clamp(ambient + diffuse_strength * diffuse, 0.05, 1.0)
+                    # Hemisphere ambient: surfaces facing up receive a bit more sky light.
+                    ambient_term = ambient * (0.76 + 0.24 * shade_y)
+                    diffuse_term = clamp(ambient_term + diffuse_strength * diffuse, 0.05, 1.0)
 
                     if not center_ready:
                         cx = (p0[0] + p1[0] + p2[0]) / 3.0
@@ -1519,9 +2088,9 @@ class ModelViewer(tk.Tk):
                                 inv_half = 1.0 / math.sqrt(half_sq)
                                 ndoth = max(
                                     0.0,
-                                    nx_unit * (hx * inv_half)
-                                    + ny_unit * (hy * inv_half)
-                                    + nz_unit * (hz * inv_half),
+                                    shade_x * (hx * inv_half)
+                                    + shade_y * (hy * inv_half)
+                                    + shade_z * (hz * inv_half),
                                 )
                                 specular_term = (ndoth**gloss_power) * specular_strength
 
@@ -1617,6 +2186,45 @@ class ModelViewer(tk.Tk):
         if depth_sort_enabled and fill_enabled and len(draw_queue) > 1:
             draw_queue.sort(key=lambda item: item[0], reverse=True)
 
+        # Planar projected shadow (Blinn-style): drop each vertex along the
+        # light direction onto a ground plane just below the model.
+        shadow_polys: list[tuple[float, ...]] = []
+        skip_shadow = (
+            interacting and self.quality_var.get() == "Auto" and triangle_count > 9000
+        )
+        if shadow_enabled and not skip_shadow and ly > SHADOW_MIN_LIGHT_Y:
+            # The shadow is a soft visual cue; half resolution is plenty.
+            shadow_stride = stride * 2 if triangle_count // stride > 2500 else stride
+            ground_y = rotated_min_y - 0.045
+            ground_screen_ortho_y = -ground_y * scale + offset_y
+            inv_ly = 1.0 / ly
+            for tri_idx in range(0, triangle_count, shadow_stride):
+                tri = triangles[tri_idx]
+                points: list[float] = []
+                visible = True
+                for vertex_index in (tri.i0, tri.i1, tri.i2):
+                    px, py, pz = rotated[vertex_index]
+                    travel = (py - ground_y) * inv_ly
+                    shadow_x = px - travel * lx
+                    shadow_z = pz - travel * lz
+                    if use_ortho:
+                        points.append(shadow_x * scale + offset_x)
+                        points.append(ground_screen_ortho_y)
+                    else:
+                        z_cam = shadow_z + self.camera_distance
+                        if z_cam <= near_clip:
+                            visible = False
+                            break
+                        perspective = self.focal_length / z_cam
+                        points.append(shadow_x * scale * perspective + offset_x)
+                        points.append(-ground_y * scale * perspective + offset_y)
+                if visible:
+                    shadow_polys.append(tuple(points))
+
+            shadow_fill = self._shadow_color
+            for coords in shadow_polys:
+                self.canvas.create_polygon(coords, fill=shadow_fill, outline="")
+
         outline_color = "#1f2a38" if not self.dark_bg_var.get() else "#9db0c6"
         wire_width = max(1, int(round(self.wire_width_var.get())))
         heat_min = 0.0
@@ -1626,6 +2234,7 @@ class ModelViewer(tk.Tk):
             heat_min = min(depth_values)
             heat_span = max(1e-9, max(depth_values) - heat_min)
 
+        capture_polys: list[tuple[tuple[float, ...], str]] = []
         for depth_key, tri_coords, color in draw_queue:
             fill_color = color
             if fill_enabled and depth_heatmap_mode:
@@ -1637,6 +2246,17 @@ class ModelViewer(tk.Tk):
                 outline=outline_color if wire_enabled else "",
                 width=wire_width if wire_enabled else 0,
             )
+            capture_polys.append((tri_coords, fill_color if fill_enabled else ""))
+
+        self._last_render_capture = {
+            "width": width,
+            "height": height,
+            "bg": self.canvas.cget("bg"),
+            "shadow": (shadow_polys, self._shadow_color),
+            "polys": capture_polys,
+            "outline": outline_color if wire_enabled else "",
+            "wire_width": wire_width if wire_enabled else 0,
+        }
 
         if show_normals and normal_lines:
             normal_color = "#f29f32" if not self.dark_bg_var.get() else "#ffd07e"
@@ -1712,6 +2332,50 @@ class ModelViewer(tk.Tk):
         )
 
 
+def _enable_windows_dpi_awareness() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="PyOBJViewer",
+        description="Dependency-free 3D model viewer for OBJ and STL files.",
+    )
+    parser.add_argument("path", nargs="?", help="model file to open (.obj or .stl)")
+    parser.add_argument("--dark", action="store_true", help="start with the dark background")
+    parser.add_argument("--ortho", action="store_true", help="start in orthographic projection")
+    parser.add_argument("--spin", action="store_true", help="start with auto-spin enabled")
+    parser.add_argument("--no-shadow", action="store_true", help="disable the ground shadow")
+    parser.add_argument(
+        "--quality",
+        choices=("Auto", "High", "Balanced", "Fast"),
+        help="initial render quality preset",
+    )
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
+    cli_args = _parse_args(sys.argv[1:])
+    _enable_windows_dpi_awareness()
     app = ModelViewer()
+    if cli_args.dark:
+        app.dark_bg_var.set(True)
+        app._apply_background_theme()
+    if cli_args.ortho:
+        app.ortho_var.set(True)
+    if cli_args.spin:
+        app.auto_spin_var.set(True)
+    if cli_args.no_shadow:
+        app.shadow_var.set(False)
+    if cli_args.quality:
+        app.quality_var.set(cli_args.quality)
+    if cli_args.path:
+        app.after(60, lambda: app._load_model_from_path(cli_args.path))
     app.mainloop()

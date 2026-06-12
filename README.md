@@ -1,22 +1,88 @@
 # PyOBJViewer
 
-A minimal **Wavefront `.obj` model viewer** written in Python. The repo is intentionally lightweight and currently centers around a single entrypoint script (`main.py`) plus standard community/security files. :contentReference[oaicite:0]{index=0}
+A dependency-free **3D model viewer for Wavefront `.obj` and `.stl` files**, written in pure Python on top of Tkinter. One file, zero required packages — run it anywhere Python runs to inspect meshes during a pipeline without spinning up a full DCC.
 
-> **Status note:** This repository currently contains `main.py` (app entrypoint), `LICENSE` (MIT), `SECURITY.md`, and `CODE_OF_CONDUCT.md`. :contentReference[oaicite:1]{index=1}
+![torus example](docs/screenshot.png)
 
 ---
 
-## What it does
+## Features
 
-PyOBJViewer is intended to be a simple, hackable OBJ viewer you can run locally to quickly inspect meshes during pipelines (e.g., exporting from Blender/Maya) without spinning up a full DCC.
+**Rendering (software rasterizer on a Tk canvas)**
+- Gamma-correct **Blinn–Phong shading** — lighting is computed in linear color space and encoded back to sRGB, so falloff and mid-tones look right instead of crushed.
+- **Smooth shading** using angle-weighted vertex normals (Thürmer & Wüthrich 1998) with a **crease-angle test** (52°), so curved surfaces shade smoothly while hard edges stay hard. Authored `vn` normals are used when the OBJ provides them.
+- **Projected ground shadow** (Blinn-style planar shadow) that follows the light direction.
+- Hemisphere ambient term — upward-facing surfaces catch a little more "sky" light.
+- Painter's-algorithm depth sorting, near-plane clipping, backface culling (with invert), perspective and orthographic projection.
+- Color modes: **Material**, **Depth Heatmap**, **Normal Tint**.
+- Adaptive quality: triangle budget scales down automatically while you interact.
 
-Typical viewer capabilities for this style of tool include:
-- Loading **`.obj` geometry** (and optionally `.mtl` materials / texture references if implemented).
-- Basic **camera navigation** (orbit/pan/zoom).
-- Simple **shaded** and/or **wireframe** rendering modes.
-- Basic **lighting** for readable form.
+**Formats**
+- **OBJ**: polygons of any arity (fan-triangulated), negative indices, `mtllib`/`usemtl` diffuse colors, authored `vn` normals, and the common `v x y z r g b` vertex-color extension.
+- **STL**: binary and ASCII. Duplicated facet vertices are welded so smooth shading and mesh statistics work.
 
-(Exact feature set depends on what’s implemented in `main.py`.) :contentReference[oaicite:2]{index=2}
+**Tools**
+- **Model Info** (`F1`): vertex/triangle/edge counts, bounding size, surface area, volume (divergence theorem), boundary and non-manifold edge counts, watertightness check.
+- **Snapshot export**: resolution-independent **SVG** (no dependencies), **PNG** (needs Pillow), or PostScript.
+- Axis gizmo, bounding box, face-normal visualization, FPS/frame-time HUD.
+
+**Interaction**
+- Orbit, roll, pan; **mouse-wheel zoom toward the cursor**; release a drag while moving and the model **keeps gliding** with inertia.
+- Auto-spin turntable with speed control, fullscreen mode, light/dark theme.
+
+**Performance**
+- Pure-stdlib by default. If **NumPy** is installed it is used automatically to vectorize vertex transform and projection for meshes above ~1.5k vertices — a large speedup on 100k+ vertex models.
+
+---
+
+## Requirements
+
+- **Python 3.10+** with Tkinter (included in the standard Windows/macOS installers).
+- Nothing else. Optional extras:
+  - `numpy` — faster transforms on large meshes
+  - `pillow` — PNG snapshot export
+
+```bash
+pip install numpy pillow   # optional
+```
+
+---
+
+## Run
+
+```bash
+python main.py                       # empty viewer, use "Open OBJ"
+python main.py path/to/model.obj    # open a model straight away
+python main.py part.stl --dark --spin
+```
+
+CLI flags: `--dark`, `--ortho`, `--spin`, `--no-shadow`, `--quality {Auto,High,Balanced,Fast}`.
+
+A sample model is included: `examples/torus.obj`.
+
+---
+
+## Controls
+
+| Input | Action |
+| --- | --- |
+| Left-drag | Orbit (release while moving to glide) |
+| Shift + left-drag | Roll |
+| Right / middle-drag | Pan |
+| Mouse wheel | Zoom toward cursor |
+| `R` / `F` | Reset view / fit view |
+| `1` `2` `3` `4` `5` | Front / top / right / back / left views |
+| `W` `S` `T` | Wireframe / shading / smooth shading |
+| `H` | Ground shadow |
+| `C` `I` | Backface culling / invert culling |
+| `D` `O` | Depth sort / orthographic |
+| `M` | Cycle color mode |
+| `N` `A` `G` | Normals / axes / bounding box |
+| `B` | Dark background |
+| Space | Auto-spin |
+| `F1` | Model info |
+| `F5` | Reload model |
+| `F11` / Esc | Fullscreen / exit fullscreen |
 
 ---
 
@@ -24,139 +90,25 @@ Typical viewer capabilities for this style of tool include:
 
 ```text
 PyOBJViewer/
-├─ main.py               # application entrypoint
+├─ main.py               # the whole application
+├─ examples/torus.obj    # sample mesh
 ├─ LICENSE               # MIT
-├─ SECURITY.md           # vulnerability reporting guidance
-└─ CODE_OF_CONDUCT.md    # Contributor Covenant
-````
-
-([GitHub][1])
-
----
-
-## Requirements
-
-* **Python 3.9+** recommended (3.10/3.11 ideal on Windows).
-* Additional dependencies (if any) are determined by `main.py`.
-
-If this viewer uses a windowing/render stack (common choices are `pygame`, `pyglet`, `moderngl`, or `PyOpenGL`), you’ll need the relevant package(s) installed.
-
----
-
-## Install
-
-### 1) Clone
-
-```bash
-git clone https://github.com/kai9987kai/PyOBJViewer.git
-cd PyOBJViewer
-```
-
-([GitHub][1])
-
-### 2) (Optional) Create a venv
-
-**Windows (PowerShell):**
-
-```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-**macOS / Linux:**
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-### 3) Install dependencies
-
-If you add a `requirements.txt` later:
-
-```bash
-pip install -r requirements.txt
-```
-
-If you’re running it as-is and it errors with missing modules, install what Python reports, e.g.:
-
-```bash
-pip install pygame
-# or
-pip install pyglet
-# or
-pip install PyOpenGL PyOpenGL_accelerate
+├─ SECURITY.md
+└─ CODE_OF_CONDUCT.md
 ```
 
 ---
 
-## Run
+## Roadmap ideas
 
-From the repo root:
+- PLY (ASCII) loading
+- Per-pixel rasterization backend (z-buffer) via optional NumPy for true Gouraud shading
+- MTL texture sampling (average color per face)
+- Arcball (quaternion) rotation mode
+- `pyinstaller --onefile main.py` portable builds
 
-```bash
-python main.py
-```
-
-If your viewer accepts a path argument (recommended pattern):
-
-```bash
-python main.py path/to/model.obj
-```
-
-If it doesn’t yet, a good next step is to add CLI parsing (`argparse`) so you can drag/drop or pass an OBJ path cleanly.
-
----
-
-## Controls (recommended defaults)
-
-If you haven’t implemented controls yet, these mappings are a good standard:
-
-* **Left mouse drag**: orbit
-* **Middle mouse drag / Shift+Left drag**: pan
-* **Mouse wheel**: zoom
-* **W**: toggle wireframe
-* **L**: toggle lighting
-* **R**: reset camera
-* **Esc**: quit
-
----
-
-## Roadmap ideas (high-value additions)
-
-If you want this repo to feel “complete” and easy for others to run:
-
-1. **Add `requirements.txt`** (or `pyproject.toml`) so installs are deterministic.
-2. **Add a real README screenshot** (a single image sells the tool instantly).
-3. Add **CLI flags**:
-
-   * `--obj path.obj`
-   * `--scale 1.0`
-   * `--wireframe`
-   * `--no-textures`
-4. Support **MTL + textures** (relative-path robust resolution).
-5. Add **bounding-box framing** (`F` to frame mesh).
-6. Export lightweight builds:
-
-   * `pyinstaller --onefile main.py` for a portable `.exe` (fits your preference for prebuilt GUI tools).
-
----
-
-## Contributing
-
-Contributions are welcome.
-
-* Please follow the repo’s **Code of Conduct**. ([GitHub][1])
-* For security issues, follow **SECURITY.md** rather than opening a public issue. ([GitHub][1])
-
----
+Contributions are welcome — see the Code of Conduct, and report security issues per `SECURITY.md`.
 
 ## License
 
-MIT License. ([GitHub][1])
-
-```
-::contentReference[oaicite:8]{index=8}
-```
-
-[1]: https://github.com/kai9987kai/PyOBJViewer "GitHub - kai9987kai/PyOBJViewer"
+MIT.
